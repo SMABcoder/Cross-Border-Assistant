@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# App data (local-only; never commit user financial data)
+*.db
+*.db-journal
+fx_cache.json
+
+# Evidence: timestamped demo transcripts are generated per run; keep only the sample
+evidence/demo-transcript-2*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
