@@ -23,9 +23,14 @@ Topic C scope): **remittances** (expensive, opaque transfer fees),
 |---|---|
 | Remittances | Fee estimator + method comparison over an auditable fee table (`data/fees.json`), cheapest-first ranking, safety brief |
 | Tuition payments | Bill tracking with reminders at 30/14/7/3/1 days + due-today + overdue, each with a step-by-step payment guide |
-| Credit building | Educational step-by-step guide + sqlite checklist tracker with progress % (guidance only — no bureau integration, stated honestly) |
+| Tuition FX timing | **Optimizer**: PAY_NOW / WAIT / NO_SIGNAL signals comparing today's rate vs the trailing average (`cba optimize`) — advisory only, never executes |
+| Credit building | Educational step-by-step guide + sqlite checklist tracker with progress %; transparent score **estimator** (shows its math, labeled ESTIMATE); inert Baihang bureau adapter (production-gated) |
 | Multi-currency management | Live FX (free no-key API) with cache + offline fallback, ledger normalized to a base currency, budgets with 80%/100% warnings and burn-down pace |
-| Peace of mind | Target-rate alerts with per-alert cooldowns; spending forecast vs budget; bilingual chat assistant (EN/ZH) |
+| SAFE FX quota | Self-reported tracker for China's USD 50,000 annual individual FX quota, warnings at 80%/100% (`cba quota`) — cross-check with your bank |
+| Kill manual entry | CSV bank-statement importer: auto-detected columns, rule-based categorization, `--dry-run` preview (`cba import`); inert OpenBanking adapter shows where a live feed plugs in |
+| Peace of mind | Target-rate alerts with per-alert cooldowns; seasonality-aware spending forecast + per-category daily burn; bilingual chat assistant (EN/ZH) with 13 intents, follow-up chips and multi-turn context |
+| Real LLM brain | BYOK OpenAI-compatible provider over stdlib `urllib` (`CBA_LLM_API_KEY`); unset key = byte-identical deterministic engine |
+| Web UI | Local JSON API + self-contained chat page (`cba serve`); WeChat mini-program path documented |
 
 ## Official deliverables 01–06 — where each lives
 
@@ -65,12 +70,16 @@ tiers, data handling, known risks + mitigations, third-party licenses).
 
 **3. Innovation & interaction — 30%.**
 A bilingual (EN/ZH, extensible) conversational assistant with a rule-based
-intent engine over nine intents, step-by-step guides for the three hardest
-student tasks (paying tuition, sending money home, first-month budget) plus
-credit building, burn-down pace messaging ("at this pace you will spend X"),
-and a deterministic, no-hallucination design: numbers always come from the
-services, never from a language model (the optional `LLMProvider` only
-rephrases pre-computed answers and is off by default).
+intent engine over thirteen intents, follow-up suggestion chips and
+multi-turn context ("and for food?"), step-by-step guides for the three
+hardest student tasks (paying tuition, sending money home, first-month
+budget) plus credit building, burn-down pace messaging ("at this pace you
+will spend X"), seasonality-aware forecasts, a tuition FX timing optimizer,
+a SAFE quota tracker, a CSV importer that kills manual entry, a local web
+UI, and a deterministic, no-hallucination design: numbers always come from
+the services, never from a language model (the optional BYOK
+`OpenAICompatibleProvider` only rephrases pre-computed answers and is off
+by default).
 
 ## 5-minute quickstart
 
@@ -118,9 +127,24 @@ python cba/cli.py forecast
 # 10. Chat (EN or ZH)
 python cba/cli.py chat --message "convert 100 USD to CNY" --lang en
 python cba/cli.py chat --message "how do I build credit?" --lang en
-python cba/cli.py chat --message "convert 100 USD to CNY" --lang zh
+python cba/cli.py chat --message "should I pay my tuition now?" --lang en
+python cba/cli.py chat --message "check my FX quota" --lang zh
 
-# 11. Tests (146 tests, all offline-mocked)
+# 11. Tuition FX optimizer (advisory only — never moves money)
+python cba/cli.py optimize
+
+# 12. SAFE FX quota tracker (self-reported)
+python cba/cli.py quota
+python cba/cli.py quota --record 1200 --currency USD --note "tuition wire"
+
+# 13. CSV bank-statement import (dry-run first)
+python cba/cli.py import statement.csv --dry-run
+python cba/cli.py import statement.csv --apply
+
+# 14. Local web UI + JSON API
+python cba/cli.py serve --port 8000   # open http://127.0.0.1:8000
+
+# 15. Tests (263 tests, all offline-mocked)
 python -m unittest discover -s tests
 pip install pytest && python -m pytest -q
 ```
@@ -173,7 +197,30 @@ python scripts/demo.py               # verify everything works
 | `CBA_FORECAST_RECENT_WEIGHT` | `0.5` | weight of most recent month |
 | `CBA_FEES_PATH` | `./data/fees.json` | transfer fee table |
 | `CBA_DEFAULT_LANG` | `en` | assistant language |
-| `CBA_LLM_ENABLED` | `0` | enable LLM rephrasing (stub) |
+| `CBA_LLM_ENABLED` | `0` | enable LLM rephrasing |
+| `CBA_LLM_API_KEY` | (empty) | BYOK key for the OpenAI-compatible provider; empty = deterministic engine |
+| `CBA_LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint base |
+| `CBA_LLM_MODEL` | `gpt-4o-mini` | model name for `/chat/completions` |
+| `CBA_LLM_TIMEOUT` | `30` | LLM HTTP timeout (seconds) |
+| `CBA_LLM_MAX_TOKENS` | `300` | LLM reply length cap |
+| `CBA_OPTIMIZER_LOOKBACK_DAYS` | `30` | trailing-average window for the tuition FX optimizer |
+| `CBA_OPTIMIZER_SIGNAL_PCT` | `1.0` | min % edge for PAY_NOW / WAIT signals |
+| `CBA_FORECAST_MIN_HISTORY_DAYS` | `180` | min ledger span before seasonality applies |
+| `CBA_FORECAST_MIN_HISTORY_MONTHS` | `6` | min distinct months before seasonality applies |
+| `CBA_FORECAST_SEASONALITY_MONTHS` | `12` | window used to build the seasonality index |
+| `CBA_IMPORT_DEFAULT_CURRENCY` | `USD` | fallback currency for CSV rows without one |
+| `CBA_IMPORT_AUTO_DETECT_HEADERS` | `1` | auto-detect CSV column mapping |
+| `CBA_IMPORT_CATEGORY_RULES` | (see config.py) | `category:kw1\|kw2;...` auto-categorization rules |
+| `CBA_IMPORT_DATE_FORMATS` | (see config.py) | accepted CSV date formats |
+| `CBA_WEB_HOST` / `CBA_WEB_PORT` | `127.0.0.1` / `8000` | `cba serve` bind address/port |
+| `CBA_WEB_MAX_BODY_BYTES` | `65536` | max JSON body for the web API |
+| `CBA_RAILS_PRODUCTION` | `0` | master switch for payment-rail adapters (inert unless `1`; licensed integration still not implemented) |
+| `CBA_CREDIT_ESTIMATE_BASE` | `550` | base of the transparent credit score estimator |
+| `CBA_CREDIT_ESTIMATE_PER_ITEM` | `25` | points per completed checklist item |
+| `CBA_CREDIT_ESTIMATE_MAX` | `800` | estimator cap |
+| `CBA_QUOTA_ANNUAL_USD` | `50000.0` | annual individual FX quota (SAFE) |
+| `CBA_QUOTA_WARN_PCT` / `CBA_QUOTA_BREACH_PCT` | `80.0` / `100.0` | quota warning / breach thresholds |
+| `CBA_ASSISTANT_MAX_CONTEXT_TURNS` | `5` | multi-turn memory window for the assistant |
 | `CBA_SMTP_HOST/PORT/USER/PASSWORD/FROM/TO` | (empty) | email notifier |
 | `CBA_WEBHOOK_URL` | (empty) | webhook notifier |
 
@@ -181,24 +228,25 @@ python scripts/demo.py               # verify everything works
 
 ```
                     ┌─────────────────────────────┐
-                    │        cba/cli.py           │  argparse: 9 subcommands
+                    │        cba/cli.py           │  argparse: 13 subcommands
                     │      scripts/demo.py        │  walkthrough + evidence log
                     └──────────────┬──────────────┘
                                    │
                     ┌──────────────▼──────────────┐
-                    │      cba/assistant          │  Phase 2: intents, i18n (EN/ZH),
-                    │  chat() · guides · LLM stub │  guides, friendly replies
+                    │      cba/assistant          │  Phase 2: 13 intents, i18n (EN/ZH),
+                    │  chat() · guides · LLM      │  guides, chips, multi-turn context,
+                    │  BYOK provider              │  friendly replies
                     └──────┬──────────────┬───────┘
                            │              │
         ┌──────────────────▼───┐   ┌──────▼────────────┐
         │   cba/forecast       │   │   Phase 1 core    │
-        │   weighted projection│   │                   │
-        └──────────────────────┘   │ fx · ledger       │
-                                   │ budgets · alerts  │
-                                   │ tuition · transfers│
-                                   │ credit            │
-                                   └──────┬────────────┘
-                                          │
+        │   pace × seasonality │   │                   │
+        ├──────────────────────┤   │ fx · ledger       │
+        │  Phase 3 advisors    │   │ budgets · alerts  │
+        │  optimizer · quota   │   │ tuition · transfers│
+        │  importer · web      │   │ credit            │
+        │  rails (inert)       │   └──────┬────────────┘
+        └──────────────────────┘          │
                     ┌─────────────────────▼────────────────────┐
                     │  sqlite (cba.db)   │  data/*.json         │
                     │  local only        │  fees · i18n · guides│
@@ -218,12 +266,40 @@ Full design: [`ARCHITECTURE.md`](ARCHITECTURE.md) · Security: [`docs/SECURITY.m
 | `tuition` | Add/list/pay tuition bills; `--remind` shows due notifications |
 | `transfer` | Fee estimate (`--method`) or cheapest-first comparison; `--safety` prints the safety brief |
 | `credit` | Credit-building checklist (`--complete/--uncomplete/--reset`) |
-| `forecast` | Month-end spending projection (`--category/--json`) |
+| `forecast` | Month-end spending projection (`--category/--json`), seasonality-aware |
+| `optimize` | Tuition FX timing advice: PAY_NOW / WAIT / NO_SIGNAL per unpaid bill |
+| `import` | CSV bank-statement import (`--dry-run` default, `--apply` to write) |
+| `quota` | SAFE FX quota status; `--record` logs a self-reported transfer |
+| `serve` | Local web UI + JSON API (`--host/--port`) |
 | `chat` | Talk to the assistant (`--message/--lang`), interactive if no message |
+
+### BYOK: the real LLM brain
+
+The assistant's intelligence is bring-your-own-key. Set `CBA_LLM_ENABLED=1`
+and `CBA_LLM_API_KEY=<your key>` and the assistant auto-constructs an
+OpenAI-compatible provider (stdlib `urllib` — no new dependencies) that
+**rephrases** the pre-computed deterministic answer. All numbers still come
+from the services, so the LLM can never hallucinate a rate or balance.
+With the key unset, behavior is byte-identical to the deterministic engine
+(zero network calls). The key is read per call and is never logged, printed,
+or included in error messages.
+
+### Meet students where they are: web UI + WeChat path
+
+`cba serve` starts a local JSON API (`/api/chat`, `/api/rates`,
+`/api/budget`, `/api/alerts`) plus a self-contained chat page at `/`
+(no external assets; binds `127.0.0.1` by default). The endpoints are plain
+JSON-over-HTTP, so a WeChat mini-program could call them with `wx.request`.
+Shipping that would additionally require: HTTPS (WeChat forbids raw HTTP),
+TLS termination via reverse proxy, ICP filing (备案) for mainland hosting,
+per-user auth (`code2session` + tokens — the demo server has none, by design
+for localhost), and WeChat subscription-message templates for push. None of
+that is implemented here — this module is the local-demo backend; the
+mini-program frontend and production hosting/auth are separate work.
 
 ## Tests
 
-146 tests mirroring every module (`tests/test_{config,fx,ledger,budgets,alerts,tuition,transfers,credit,assistant,forecast}.py`),
+263 tests mirroring every module (`tests/test_{config,fx,ledger,budgets,alerts,tuition,transfers,credit,assistant,forecast,optimizer,importer,web,rails,quota,llm}.py`),
 written as `unittest.TestCase` so they run under both runners:
 
 ```bash
@@ -245,8 +321,14 @@ Python 3.10/3.11/3.12.
 
 ## Roadmap (deliberately deferred)
 
-- Real LLM backend behind the one-line `LLMProvider` swap (currently a stub).
+- Live payment-rail integrations (CIPS / e-CNY / mBridge adapters exist but
+  are inert and production-gated; the ISO 20022 pain.001 builder generates
+  message format only). Real execution requires a licensed partner.
+- Live credit-bureau data (the Baihang adapter is an inert interface;
+  the estimator is educational only, stated honestly).
+- Live open-banking feeds (the CSV importer works today; the
+  `OpenBankingAdapter` interface marks where a licensed feed plugs in).
 - More languages: drop a new `data/i18n/<lang>.json` — no code changes.
-- Optional credit-bureau integration for the credit module (currently guidance + checklist only, stated honestly).
 - sqlite encryption for the local DB; push/email digest scheduling.
 - Refresh cadence tooling for `data/fees.json` and `data/fallback_rates.json`.
+- WeChat mini-program frontend over the local JSON API (see above).
