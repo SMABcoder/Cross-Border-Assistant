@@ -36,7 +36,7 @@ Topic C scope): **remittances** (expensive, opaque transfer fees),
 
 | # | Deliverable | Location |
 |---|---|---|
-| 01 | Technical documentation | This repo: `ARCHITECTURE.md` + `docs/` |
+| 01 | Technical documentation | This repo: `docs/TECHNICAL-DOCUMENTATION.md` (architecture, core algorithms, security design) + `ARCHITECTURE.md` + `docs/` |
 | 02 | Presentation deck | Produced separately (not in this repo) |
 | 03 | Demo video (≤ 5 min, **required**) | Produced separately (not in this repo) |
 | 04 | Source code + README + test cases (+ deployment instructions) | **This repo** — see Deployment below |
@@ -253,7 +253,7 @@ python scripts/demo.py               # verify everything works
                     └──────────────────────────────────────────┘
 ```
 
-Full design: [`ARCHITECTURE.md`](ARCHITECTURE.md) · Security: [`docs/SECURITY.md`](docs/SECURITY.md)
+Full design: [`ARCHITECTURE.md`](ARCHITECTURE.md) · Security: [`docs/SECURITY.md`](docs/SECURITY.md) · Developer setup: [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
 
 ## CLI reference
 
