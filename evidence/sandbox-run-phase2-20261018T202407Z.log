@@ -1,0 +1,81 @@
+Cross Border Assistant — Phase-2 sandbox execution evidence
+Temp DB: /tmp/cba-evidence-95k6x7vo/cba.db | FX: offline fallback table (no network)
+
+================================================================
+1. Tuition bill + FX optimizer (advisory only)
+================================================================
+Bill #1: Spring tuition 5200.0 CNY due 2027-01-15
+Tuition FX Optimizer — 1 unpaid bill(s): 0 PAY_NOW, 0 WAIT, 1 NO_SIGNAL.
+
+⚪ [NO_SIGNAL] Spring tuition — 5,200.00 CNY (pair USD/CNY)
+   not enough rate history (need at least 30 days of data)
+
+================================================================
+2. SAFE FX quota tracker (self-reported)
+================================================================
+FX quota usage — 2026 (self-reported)
+Used:      2,304.00 USD of 50,000.00 USD (4.6%)
+Remaining: 47,696.00 USD
+[--------------------]
+Status:    OK
+Note: this tracker is self-reported — the bank's official quota statement is the authoritative record. Cross-check before acting.
+
+================================================================
+3. CSV bank-statement importer (dry-run: writes nothing)
+================================================================
+Preview: 3 rows, 0 skipped (nothing written)
+  2026-10-01 expense    45.00 CNY [food] Noodle shop
+  2026-10-02 expense   120.00 CNY [food] Campus supermarket
+  2026-10-03 expense  3000.00 CNY [other] Scholarship stipend
+
+================================================================
+4. Local web JSON API (real HTTP on localhost)
+================================================================
+GET /api/rates?base=USD&quote=CNY -> HTTP 200: {"pair": "USD/CNY", "rate": 7.25}
+GET /api/budget -> HTTP 200: {"month": "2026-10", "base_currency": "USD", "warnings": [], "total": {"limit": null, "spent": 0.0, "remaining": null, "pct": null}, "per_category": {}}
+POST /api/chat -> HTTP 200: {"reply": "\ud83d\udcb1 100.00 USD = 725.00 CNY (rate 1 USD = 7.2500 CNY).\nTrend: flat (0.0% over recent history).\nWant to set a rate alert?\n\ud83d\udca1 Try: set a rate alert \u00b7 compare transf…
+
+================================================================
+5. Assistant with no LLM key (deterministic engine)
+================================================================
+LLM active: False
+
+you> should I pay my tuition now?
+Tuition FX Optimizer — 1 unpaid bill(s): 0 PAY_NOW, 0 WAIT, 1 NO_SIGNAL.
+
+⚪ [NO_SIGNAL] Spring tuition — 5,200.00 CNY (pair USD/CNY)
+   not enough rate history (need at least 30 days of data)
+💡 Try: set a rate alert · check my FX quota
+
+you> check my FX quota
+FX quota usage — 2026 (self-reported)
+Used:      2,304.00 USD of 50,000.00 USD (4.6%)
+Remaining: 47,696.00 USD
+[--------------------]
+Status:    OK
+Note: this tracker is self-reported — the bank's official quota statement is the authoritative record. Cross-check before acting.
+💡 Try: compare transfer methods
+
+you> convert 100 USD to CNY
+💱 100.00 USD = 725.00 CNY (rate 1 USD = 7.2500 CNY).
+Trend: flat (0.0% over recent history).
+Want to set a rate alert?
+💡 Try: set a rate alert · compare transfer methods
+
+================================================================
+6. Payment rails stay inert (production-gated)
+================================================================
+CIPS: refused as designed -> CIPS: production rail is disabled - refusing to act. Enable only with CBA_RAILS_PRODUCTION=1 plus a licensed integration (not implemented in this prototype).
+e-CNY: refused as designed -> e-CNY: production rail is disabled - refusing to act. Enable only with CBA_RAILS_PRODUCTION=1 plus a licensed integration (not implemented in this prototype).
+pain.001 generated: 772 bytes of XML (format only — never transmitted)
+
+================================================================
+7. Credit checklist + transparent score estimator
+================================================================
+Checklist: 2/7 done
+Score ESTIMATE: 600 (550 + 2 completed x 25 pts = 600 -> capped at 800 = 600)
+Disclaimer: Rough educational estimate from your checklist progress only. Not a bureau score — lenders and bureaus use their own models and data.
+
+================================================================
+DONE — all Phase-2 capabilities executed in sandbox
+================================================================
