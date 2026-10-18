@@ -13,6 +13,10 @@ INTENTS = (
     "credit_advice",
     "guide",
     "forecast",
+    "optimize",
+    "quota",
+    "import_advice",
+    "serve_web",
     "help",
 )
 
@@ -61,6 +65,31 @@ class IntentParser:
                     "target": float(m.group(4)),
                 },
             )
+
+        # New intents, checked early so they aren't swallowed by the
+        # broader keyword matches below.
+        if any(k in low for k in ("optimiz", "should i pay", "pay now", "时机")) and any(
+            k in low for k in ("tuition", "fee", "学费", "bill")
+        ):
+            return Intent("optimize")
+
+        if any(k in low for k in ("quota", "额度", "外汇", "safe quota")):
+            return Intent("quota")
+
+        if (
+            any(k in low for k in ("import", "csv", "导入", "对账单"))
+            or "bank statement" in low
+        ):
+            m = re.search(r"[\w\-./\\]+\.csv", text, re.IGNORECASE)
+            return Intent(
+                "import_advice",
+                entities={"path": m.group(0) if m else None},
+            )
+
+        if any(
+            k in low for k in ("serve", "web ui", "web page", "网页", "browser ui")
+        ):
+            return Intent("serve_web")
 
         if any(k in low for k in ("credit", "信用", "征信", "credit score", "credit card")):
             return Intent("credit_advice")
