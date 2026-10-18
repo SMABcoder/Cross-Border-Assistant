@@ -281,8 +281,15 @@ OpenAI-compatible provider (stdlib `urllib` — no new dependencies) that
 **rephrases** the pre-computed deterministic answer. All numbers still come
 from the services, so the LLM can never hallucinate a rate or balance.
 With the key unset, behavior is byte-identical to the deterministic engine
-(zero network calls). The key is read per call and is never logged, printed,
-or included in error messages.
+(zero network calls). A ready-made template lives in `.env.example` —
+copy it to `.env` (gitignored) and fill in your own key; real keys never
+belong in the repo.
+
+Real-time mode, verified: with `CBA_LLM_ENABLED=1` and a valid
+`CBA_LLM_API_KEY`, every chat reply is computed deterministically first and
+then rephrased live by the model (default `gpt-4o-mini`) — warm tone, same
+numbers. If the provider call fails, the assistant falls back to the
+deterministic draft automatically.
 
 ### Meet students where they are: web UI + WeChat path
 
