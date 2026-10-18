@@ -11,6 +11,10 @@ Every subcommand is demoable in seconds::
     python cba/cli.py chat --message "convert 100 USD to CNY"
     python cba/cli.py forecast
     python cba/cli.py credit --complete secured_card
+    python cba/cli.py optimize
+    python cba/cli.py quota
+    python cba/cli.py import statement.csv --dry-run
+    python cba/cli.py serve --port 8000
 """
 from __future__ import annotations
 
@@ -30,9 +34,13 @@ from cba.common import fmt_money
 from cba.credit import CreditService
 from cba.forecast import ForecastService
 from cba.fx import FxService
+from cba.importer import CsvImporter
 from cba.ledger import LedgerService
+from cba.optimizer import OptimizerService
+from cba.quota import QuotaService
 from cba.transfers import FeeEstimator
 from cba.tuition import TuitionService
+from cba.web import WebApp
 
 
 def cmd_rates(args) -> int:
@@ -200,6 +208,60 @@ def cmd_forecast(args) -> int:
     return 0
 
 
+def cmd_optimize(args) -> int:
+    """Advisory only: PAY_NOW / WAIT / NO_SIGNAL per unpaid tuition bill."""
+    svc = OptimizerService()
+    print(OptimizerService.format_report(svc.optimize()))
+    return 0
+
+
+def cmd_import(args) -> int:
+    importer = CsvImporter()
+    result = importer.import_file(
+        args.path,
+        dry_run=args.dry_run,
+        date_col=args.date_col,
+        desc_col=args.desc_col,
+        amount_col=args.amount_col,
+        currency_col=args.currency_col,
+        debit_col=args.debit_col,
+        credit_col=args.credit_col,
+        default_currency=args.currency,
+    )
+    if args.dry_run:
+        print(f"Preview: {result['total']} rows, {result['skipped']} skipped (nothing written).")
+        print("Run with --apply to write these to the ledger.")
+        for row in result["rows"][:20]:
+            print(f"  {row['date']} {row['kind']:7} {row['amount']:>10.2f} "
+                  f"{row['currency']} [{row['category']}] {row['description']}")
+        if result["total"] > 20:
+            print(f"  ... and {result['total'] - 20} more rows")
+    else:
+        print(f"Imported {result['imported']} rows ({result['skipped']} skipped).")
+    print("By category:", result["by_category"])
+    return 0
+
+
+def cmd_quota(args) -> int:
+    svc = QuotaService()
+    if args.record is not None:
+        from cba.common import today_iso
+
+        row = svc.record(args.date or today_iso(), args.record,
+                         args.currency, args.note)
+        print(f"Recorded: {row['date']} {row['amount']} {row['currency']} "
+              f"(~{row['amount_usd']:.2f} USD) — {row['note'] or 'no note'}")
+        print("Self-reported entry: cross-check with your bank's official quota statement.")
+        return 0
+    print(svc.format_status(svc.status(year=args.year)))
+    return 0
+
+
+def cmd_serve(args) -> int:
+    WebApp().run(host=args.host, port=args.port)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="cba", description="Cross Border Assistant — student finance CLI"
@@ -269,6 +331,39 @@ def build_parser() -> argparse.ArgumentParser:
     cr.add_argument("--uncomplete", default=None, help="mark item key as not done")
     cr.add_argument("--reset", action="store_true")
     cr.set_defaults(func=cmd_credit)
+
+    o = sub.add_parser("optimize", help="FX timing advice for unpaid tuition bills")
+    o.set_defaults(func=cmd_optimize)
+
+    im = sub.add_parser("import", help="Import a CSV bank statement into the ledger")
+    im.add_argument("path", help="path to the CSV statement file")
+    im.add_argument("--dry-run", dest="dry_run", action="store_true", default=True,
+                    help="preview only; write nothing (default)")
+    im.add_argument("--apply", dest="dry_run", action="store_false",
+                    help="write the imported rows to the ledger")
+    im.add_argument("--date-col", default=None)
+    im.add_argument("--desc-col", default=None)
+    im.add_argument("--amount-col", default=None)
+    im.add_argument("--currency-col", default=None)
+    im.add_argument("--debit-col", default=None)
+    im.add_argument("--credit-col", default=None)
+    im.add_argument("--currency", default=None,
+                    help="default currency when the CSV has no currency column")
+    im.set_defaults(func=cmd_import)
+
+    q = sub.add_parser("quota", help="SAFE FX quota tracker (self-reported)")
+    q.add_argument("--year", type=int, default=None, help="calendar year (default: current)")
+    q.add_argument("--record", type=float, default=None,
+                   help="record a transfer amount (self-reported, no money moves)")
+    q.add_argument("--currency", default="USD", help="currency of --record amount")
+    q.add_argument("--note", default="", help="optional note for --record")
+    q.add_argument("--date", default=None, help="transfer date YYYY-MM-DD (default: today)")
+    q.set_defaults(func=cmd_quota)
+
+    s = sub.add_parser("serve", help="Start the local web UI + JSON API")
+    s.add_argument("--host", default=None, help="bind address (default: CBA_WEB_HOST)")
+    s.add_argument("--port", type=int, default=None, help="port (default: CBA_WEB_PORT)")
+    s.set_defaults(func=cmd_serve)
 
     return p
 

@@ -34,3 +34,12 @@ def fmt_money(amount: float, currency: str) -> str:
     """Format an amount like '1,250.50 USD'."""
     sign = "-" if amount < 0 else ""
     return f"{sign}{abs(amount):,.2f} {currency}"
+
+
+class ProductionGatedError(Exception):
+    """Raised when code paths requiring a licensed production integration
+    (live bank feeds, payment rails, credit bureaus) are invoked.
+
+    This prototype is deliberately inert here: it never holds bank
+    credentials, never contacts payment rails, and never moves money.
+    """
