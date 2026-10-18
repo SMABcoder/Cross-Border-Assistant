@@ -14,16 +14,18 @@ cause side effects**, and state-changing components are narrow and local.
 
 | Tier | Components | Allowed actions |
 |------|-----------|-----------------|
-| T0 — read-only queries | `cba/fx` (rate lookups), `cba/assistant` chat handlers for `convert`, `budget_status`, `tuition_due` (read), `transfer_advice` (estimates), `forecast`, `guide` | Read sqlite, read JSON data files, call the public FX API. **No writes, no network calls except the FX API.** |
-| T1 — local state changes | `cba/ledger.add`, `cba/budgets.set_budget`, `cba/tuition` CRUD, `cba/credit` checklist, `cba/alerts.create/deactivate`, FX cache writes | Write to the **local sqlite database file only** (`cba.db` by default). No network, no external services. |
+| T0 — read-only queries | `cba/fx` (rate lookups), `cba/assistant` chat handlers for `convert`, `budget_status`, `tuition_due` (read), `transfer_advice` (estimates), `forecast`, `guide`, `optimize`, `quota` (read) | Read sqlite, read JSON data files, call the public FX API. **No writes, no network calls except the FX API.** The optimizer is advisory-only: it compares rates and prints signals, never acts on them. |
+| T1 — local state changes | `cba/ledger.add`, `cba/budgets.set_budget`, `cba/tuition` CRUD, `cba/credit` checklist, `cba/alerts.create/deactivate`, `cba/quota.record`, `cba/importer.import_file`, FX cache writes, `cba/web` request handlers | Write to the **local sqlite database file only** (`cba.db` by default). No network, no external services. The web server binds `127.0.0.1` by default and serves only this local data; it has no auth by design for localhost demos — production exposure requires a reverse proxy (TLS) + auth, documented in `cba/web`. |
 | T2 — outbound notifications | `EmailNotifier` (smtplib), `WebhookNotifier` (HTTPS POST), `ConsoleNotifier` (stdout) | Send **alert text the user configured**. The email notifier is **inert unless SMTP credentials are provided** via environment (`CBA_SMTP_HOST`, `CBA_SMTP_TO`, …). The webhook notifier only fires when `CBA_WEBHOOK_URL` is set. |
-| T3 — explicitly absent | — | **No real money movement.** The transfer module is a fee *estimator* over a static table (`data/fees.json`); it cannot initiate, authorize, or settle any payment. **No credit-bureau integration**; the credit module is guidance + a local checklist. **No credential collection** anywhere in the code. |
+| T3 — explicitly absent | — | **No real money movement.** The transfer module is a fee *estimator* over a static table (`data/fees.json`); it cannot initiate, authorize, or settle any payment. The `cba/rails` adapters (CIPS / e-CNY / mBridge) are **inert by construction**: every rail-touching method raises `ProductionGatedError` while `CBA_RAILS_PRODUCTION` is unset, and `NotImplementedError` even when set (the licensed integration does not exist). `build_pain001` generates ISO 20022 message *text* only — generation is not transmission, signing, or settlement. **No credit-bureau integration**; the credit module is guidance + a local checklist + a labeled estimator, and `InertBaihangAdapter` refuses all bureau calls. **No live bank feeds**; `InertOpenBankingAdapter` refuses all feed calls. **No credential collection** anywhere in the code. |
 
 Enforcement is by construction: T0 functions take no notifier/db-write
 paths; the `LLMProvider` integration is disabled by default
-(`CBA_LLM_ENABLED=0`) and, when enabled, only *rephrases* rule-based
-answers — numbers always come from T0 services, so an LLM can never
-hallucinate a rate or balance into a user-facing figure.
+(`CBA_LLM_ENABLED=0`) and, when enabled via BYOK, only *rephrases*
+rule-based answers — numbers always come from T0 services, so an LLM can
+never hallucinate a rate or balance into a user-facing figure. The LLM API
+key (`CBA_LLM_API_KEY`) is read per call, never logged, never printed, and
+never included in error messages (covered by a dedicated test).
 
 ## 2. Data handling
 
@@ -52,6 +54,10 @@ hallucinate a rate or balance into a user-facing figure.
 | R5 | Misinterpreted as financial advice / real transfers | Low / High | The transfer module is labeled an *estimator* in UI text, README, and code; `safety_brief()` warns against unlicensed channels and structuring; no payment rails exist in the code. |
 | R6 | LLM rephrasing alters a number (if enabled) | Low / Medium | LLM is off by default; when on, it only rephrases a pre-computed draft and failures fall back to the draft. |
 | R7 | Local DB file read by another user on a shared machine | Low / Medium | Documented: keep `cba.db` in a private directory; future work could add sqlite encryption (see roadmap). |
+| R8 | Web UI (`cba serve`) exposed beyond localhost | Low / High | Binds `127.0.0.1` by default; no auth by design for local demos. Documented: any internet-facing deployment needs a reverse proxy (TLS) + per-user auth before first use. |
+| R9 | CSV import mis-categorizes or mis-reads a statement | Medium / Low | `--dry-run` is the default: the user previews every row, category and amount before `--apply` writes anything; the single-amount positive heuristic is documented in-app. |
+| R10 | Quota tracker mistaken for the authoritative bank record | Low / Medium | Every quota string states it is self-reported and names the bank's official statement as authoritative; the module never claims live quota knowledge. |
+| R11 | LLM API key leaks via logs or errors | Low / High | Key read per call, never logged/printed; error paths redact it; dedicated test asserts the key never appears in `LLMError` text. |
 
 ## 4. Third-party components and licenses
 
@@ -71,5 +77,7 @@ No SDKs, no analytics, no tracking, no bundled binaries.
   local-only data, no money movement, no PII collection, graceful
   degradation, and this self-assessment constitute the compliance story.
 - **Honest limitations:** FX fallback rates can go stale; fee tables need
-  quarterly review; the credit module is educational only. All are stated
-  in-app and in docs rather than hidden.
+  quarterly review; the credit module is educational only (the score is a
+  labeled estimator, not a bureau score); the quota tracker is self-reported;
+  the optimizer advises but never executes; the rails adapters are inert.
+  All are stated in-app and in docs rather than hidden.
