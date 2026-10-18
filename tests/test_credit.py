@@ -119,5 +119,82 @@ class TestCreditAssistant(TempDirTestCase):
         self.assertIn("credit", reply.lower())
 
 
+class TestCreditEstimate(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.credit = CreditService(db_path=self.db)
+
+    def test_fresh_estimate_equals_base(self):
+        import config
+
+        est = self.credit.estimate_score()
+        self.assertEqual(est["estimate"], config.CREDIT_ESTIMATE_BASE)
+        self.assertEqual(est["items_done"], 0)
+        self.assertEqual(est["items_total"], len(self.credit.items()))
+
+    def test_estimate_math_two_items(self):
+        import config
+
+        self.credit.complete("secured_card")
+        self.credit.complete("bank_account")
+        est = self.credit.estimate_score()
+        self.assertEqual(
+            est["estimate"], config.CREDIT_ESTIMATE_BASE + 2 * config.CREDIT_ESTIMATE_PER_ITEM
+        )
+        self.assertEqual(est["items_done"], 2)
+
+    def test_estimate_capped(self):
+        import config
+
+        for item in self.credit.items():
+            self.credit.complete(item["key"])
+        orig = config.CREDIT_ESTIMATE_MAX
+        config.CREDIT_ESTIMATE_MAX = 560
+        try:
+            est = self.credit.estimate_score()
+            self.assertEqual(est["estimate"], 560)
+            self.assertEqual(est["max"], 560)
+            self.assertIn("capped at 560", est["math"])
+        finally:
+            config.CREDIT_ESTIMATE_MAX = orig
+
+    def test_estimate_disclaimer(self):
+        est = self.credit.estimate_score()
+        self.assertIn("Not a bureau score", est["disclaimer"])
+
+    def test_estimate_math_string_shows_numbers(self):
+        import config
+
+        est = self.credit.estimate_score()
+        for n in (
+            config.CREDIT_ESTIMATE_BASE,
+            config.CREDIT_ESTIMATE_PER_ITEM,
+            config.CREDIT_ESTIMATE_MAX,
+        ):
+            self.assertIn(str(n), est["math"])
+
+    def test_progress_and_items_untouched(self):
+        prog = self.credit.progress()
+        self.assertEqual(prog["done"], 0)
+        self.assertGreaterEqual(len(self.credit.items()), 6)
+        self.credit.estimate_score()  # must not mutate checklist state
+        self.assertEqual(self.credit.progress()["done"], 0)
+
+
+class TestInertBaihangAdapter(unittest.TestCase):
+    def test_fetch_report_raises_production_gated(self):
+        from cba.common import ProductionGatedError
+        from cba.credit import InertBaihangAdapter
+
+        with self.assertRaises(ProductionGatedError):
+            InertBaihangAdapter().fetch_report("subject-123")
+
+    def test_adapter_satisfies_protocol(self):
+        from cba.credit import InertBaihangAdapter
+
+        adapter = InertBaihangAdapter()
+        self.assertTrue(callable(getattr(adapter, "fetch_report", None)))
+
+
 if __name__ == "__main__":
     unittest.main()

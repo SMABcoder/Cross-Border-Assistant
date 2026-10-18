@@ -187,5 +187,186 @@ class TestAssistantChat(TempDirTestCase):
         self.assertIn(f"{rate:.4f}", reply)
 
 
+class TestNewIntents(unittest.TestCase):
+    def setUp(self):
+        self.p = IntentParser()
+
+    def test_optimize_should_i_pay(self):
+        i = self.p.parse("should I pay my tuition now?")
+        self.assertEqual(i.name, "optimize")
+
+    def test_optimize_keyword(self):
+        self.assertEqual(self.p.parse("optimize my tuition FX").name, "optimize")
+
+    def test_optimize_zh(self):
+        self.assertEqual(self.p.parse("现在交学费时机好吗？").name, "optimize")
+
+    def test_quota_en(self):
+        self.assertEqual(self.p.parse("check my FX quota").name, "quota")
+
+    def test_quota_zh(self):
+        self.assertEqual(self.p.parse("我的外汇额度用了多少").name, "quota")
+
+    def test_import_advice_with_path(self):
+        i = self.p.parse("import my bank statement jan.csv")
+        self.assertEqual(i.name, "import_advice")
+        self.assertEqual(i.entities["path"], "jan.csv")
+
+    def test_import_advice_no_path(self):
+        i = self.p.parse("can I import a bank statement?")
+        self.assertEqual(i.name, "import_advice")
+        self.assertIsNone(i.entities["path"])
+
+    def test_credit_card_statement_not_import(self):
+        # "credit card statement" has no import/csv/bank-statement keyword.
+        self.assertEqual(self.p.parse("credit card statement").name, "credit_advice")
+
+    def test_serve_web(self):
+        self.assertEqual(self.p.parse("open the web ui").name, "serve_web")
+
+    def test_optimize_does_not_swallow_tuition_due(self):
+        self.assertEqual(self.p.parse("when is my tuition due?").name, "tuition_due")
+
+    def test_budget_50000_alone_not_quota(self):
+        self.assertNotEqual(self.p.parse("50000").name, "quota")
+
+
+class TestNewHandlers(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.a = Assistant(db_path=self.db, fx=self.fx)
+
+    def test_chat_optimize_empty(self):
+        reply = self.a.chat("should I pay my tuition now?")
+        self.assertIn("No unpaid tuition bills", reply)
+        self.assertIn("💡", reply)
+
+    def test_chat_quota_empty(self):
+        reply = self.a.chat("check my quota")
+        self.assertIn("50,000", reply)
+        self.assertIn("💡", reply)
+
+    def test_chat_import_help(self):
+        reply = self.a.chat("help me import my statement")
+        self.assertIn("CSV", reply)
+
+    def test_chat_import_preview(self):
+        import csv
+        import os
+
+        path = os.path.join(self.tmp, "stmt.csv")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Date", "Description", "Amount"])
+            w.writerow(["2026-10-01", "Noodle shop", "-12.50"])
+            w.writerow(["2026-10-02", "Bookstore", "-30.00"])
+        reply = self.a.chat("import %s" % path)
+        self.assertIn("Preview", reply)
+        self.assertIn("Nothing was written", reply)
+        # Dry run: nothing reaches the ledger.
+        today = date.today()
+        self.assertEqual(
+            self.a.ledger.summary(today.year, today.month)["expense"], 0.0
+        )
+
+    def test_chat_serve_web(self):
+        reply = self.a.chat("open the web ui")
+        self.assertIn("8000", reply)
+
+    def test_chat_chips_on_convert(self):
+        reply = self.a.chat("convert 100 USD to CNY")
+        self.assertIn("💡", reply)
+        self.assertIn("set a rate alert", reply)
+
+    def test_multiturn_budget_category(self):
+        today = date.today()
+        self.a.budgets.set_budget(today.year, today.month, 1000, "USD")
+        self.a.budgets.set_budget(today.year, today.month, 500, "USD", category="food")
+        self.a.ledger.add("expense", 50, "USD", "food", date_=today.isoformat())
+        self.a.chat("how is my budget?")
+        reply = self.a.chat("and for food?")
+        self.assertIn("food", reply.lower())
+        self.assertIn("50.00", reply)
+
+    def test_multiturn_foreign_followup_isolated(self):
+        # "for USD to CNY" is a conversion, not a category follow-up.
+        today = date.today()
+        self.a.budgets.set_budget(today.year, today.month, 1000, "USD")
+        self.a.chat("how is my budget?")
+        reply = self.a.chat("convert 1 USD to CNY")
+        self.assertIn("CNY", reply)
+
+    def test_context_history_trimmed(self):
+        import config as _config
+
+        old = _config.ASSISTANT_MAX_CONTEXT_TURNS
+        _config.ASSISTANT_MAX_CONTEXT_TURNS = 2
+        try:
+            self.a.chat("hello")
+            self.a.chat("hello")
+            self.a.chat("hello")
+            self.assertLessEqual(len(self.a._ctx["history"]), 2)
+        finally:
+            _config.ASSISTANT_MAX_CONTEXT_TURNS = old
+
+
+class TestDefaultLLMWiring(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        import config as _config
+
+        self._config = _config
+        self._old_enabled = _config.LLM_ENABLED
+        self._old_key = _config.LLM_API_KEY
+
+    def tearDown(self):
+        self._config.LLM_ENABLED = self._old_enabled
+        self._config.LLM_API_KEY = self._old_key
+
+    def test_llm_auto_constructed_with_key(self):
+        from cba.assistant.llm import OpenAICompatibleProvider
+
+        self._config.LLM_ENABLED = True
+        self._config.LLM_API_KEY = "test-key"
+        a = Assistant(db_path=self.db, fx=self.fx)
+        self.assertIsInstance(a.llm, OpenAICompatibleProvider)
+
+    def test_llm_none_without_key(self):
+        self._config.LLM_ENABLED = True
+        self._config.LLM_API_KEY = ""
+        a = Assistant(db_path=self.db, fx=self.fx)
+        self.assertIsNone(a.llm)
+
+    def test_llm_none_when_disabled(self):
+        self._config.LLM_ENABLED = False
+        self._config.LLM_API_KEY = "test-key"
+        a = Assistant(db_path=self.db, fx=self.fx)
+        self.assertIsNone(a.llm)
+
+
+class TestNewI18n(unittest.TestCase):
+    def setUp(self):
+        i18n.reset_cache()
+
+    def test_zh_suggest_optimize_is_translated(self):
+        self.assertNotEqual(i18n.t("suggest_optimize", "zh"), "suggest_optimize")
+        self.assertIn("学费", i18n.t("suggest_optimize", "zh"))
+
+    def test_en_serve_help(self):
+        self.assertIn("8000", i18n.t("serve_help", "en"))
+
+    def test_chips_prefix_zh(self):
+        self.assertIn("试试", i18n.t("chips_prefix", "zh"))
+
+    def test_all_chip_keys_translated(self):
+        keys = ("suggest_optimize", "suggest_quota", "suggest_transfer",
+                "suggest_budget", "suggest_credit", "chips_prefix",
+                "import_help", "serve_help", "import_preview_header",
+                "import_preview_row", "budget_category_line")
+        for key in keys:
+            self.assertNotEqual(i18n.t(key, "zh"), key, key)
+            self.assertNotEqual(i18n.t(key, "en"), key, key)
+
+
 if __name__ == "__main__":
     unittest.main()
