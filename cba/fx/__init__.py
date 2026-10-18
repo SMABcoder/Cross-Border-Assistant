@@ -1,232 +1,211 @@
-"""Target-rate alerts with per-alert cooldown and pluggable notifiers."""
+"""Exchange-rate layer.
+
+Providers implement the :class:`RateProvider` protocol. :class:`FxService`
+chains live provider -> cache -> fallback table so the assistant keeps
+working offline.
+
+Live data comes from the free no-key endpoint ``open.er-api.com``
+(configurable via ``CBA_FX_API_BASE``). ``requests`` is used when
+importable, otherwise stdlib ``urllib``.
+"""
 from __future__ import annotations
 
 import json
-import smtplib
+import time
 import urllib.request
-from email.message import EmailMessage
 from pathlib import Path
 from typing import Protocol
 
 import config
-from cba.common import connect_db, now_ts
-from cba.fx import FxService
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS rate_alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pair TEXT NOT NULL,
-    base TEXT NOT NULL,
-    quote TEXT NOT NULL,
-    target REAL NOT NULL CHECK (target > 0),
-    direction TEXT NOT NULL CHECK (direction IN ('above', 'below')),
-    note TEXT NOT NULL DEFAULT '',
-    created_at INTEGER NOT NULL,
-    last_triggered_at INTEGER NOT NULL DEFAULT 0,
-    active INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS alert_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    alert_id INTEGER NOT NULL REFERENCES rate_alerts(id),
-    rate REAL NOT NULL,
-    triggered_at INTEGER NOT NULL
-);
-"""
+try:  # optional dependency
+    import requests  # type: ignore
+
+    _HAS_REQUESTS = True
+except Exception:  # pragma: no cover - env dependent
+    requests = None  # type: ignore
+    _HAS_REQUESTS = False
 
 
-class Notifier(Protocol):
-    def notify(self, subject: str, message: str) -> bool: ...
+class RateProvider(Protocol):
+    """Anything that can return a rate table for a base currency."""
+
+    def get_table(self, base: str) -> dict[str, float]: ...
 
 
-class ConsoleNotifier:
-    def notify(self, subject: str, message: str) -> bool:
-        print(f"[ALERT] {subject}\n{message}")
-        return True
+class FxError(Exception):
+    """Raised when no provider can supply rates."""
 
 
-class EmailNotifier:
-    """SMTP notifier; inactive (returns False) unless SMTP is configured."""
-
-    def __init__(self) -> None:
-        self.configured = bool(config.SMTP_HOST and config.SMTP_TO)
-
-    def notify(self, subject: str, message: str) -> bool:
-        if not self.configured:
-            return False
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = config.SMTP_FROM or config.SMTP_USER
-        msg["To"] = config.SMTP_TO
-        msg.set_content(message)
-        try:
-            with smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT, timeout=15) as s:
-                s.starttls()
-                if config.SMTP_USER:
-                    s.login(config.SMTP_USER, config.SMTP_PASSWORD)
-                s.send_message(msg)
-            return True
-        except Exception:
-            return False
-
-
-class WebhookNotifier:
-    def __init__(self, url: str) -> None:
-        self.url = url
-
-    def notify(self, subject: str, message: str) -> bool:
-        payload = json.dumps({"subject": subject, "message": message}).encode()
-        req = urllib.request.Request(
-            self.url, data=payload, headers={"Content-Type": "application/json"}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10):
-                return True
-        except Exception:
-            return False
-
-
-class AlertService:
-    """Create rate alerts and evaluate them against live rates."""
+class SimpleApiProvider:
+    """Fetch live rates from the free no-key JSON endpoint."""
 
     def __init__(
         self,
-        db_path: str | Path | None = None,
-        fx: FxService | None = None,
-        notifiers: list[Notifier] | None = None,
+        api_base: str | None = None,
+        timeout: int | None = None,
     ) -> None:
-        self.db_path = Path(db_path) if db_path else Path(config.DB_PATH)
-        self.fx = fx or FxService()
-        self.notifiers = notifiers if notifiers is not None else [ConsoleNotifier()]
-        conn = connect_db(self.db_path)
+        self.api_base = (api_base or config.FX_API_BASE).rstrip("/")
+        self.timeout = timeout if timeout is not None else config.FX_TIMEOUT
+
+    def get_table(self, base: str) -> dict[str, float]:
+        url = f"{self.api_base}/{base.upper()}"
         try:
-            conn.executescript(_SCHEMA)
-            conn.commit()
-        finally:
-            conn.close()
+            if _HAS_REQUESTS:
+                resp = requests.get(url, timeout=self.timeout)
+                resp.raise_for_status()
+                payload = resp.json()
+            else:
+                with urllib.request.urlopen(url, timeout=self.timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            raise FxError(f"live rate fetch failed for {base}: {exc}") from exc
+        if payload.get("result") != "success":
+            raise FxError(f"rate API error for {base}: {payload.get('error-type')}")
+        rates = payload.get("rates") or {}
+        return {k.upper(): float(v) for k, v in rates.items()}
 
-    # -- CRUD -------------------------------------------------------------
-    def create(
-        self, pair: str, target: float, direction: str, note: str = ""
-    ) -> dict:
-        direction = direction.lower()
-        if direction not in ("above", "below"):
-            raise ValueError("direction must be 'above' or 'below'")
-        target = float(target)
-        if target <= 0:
-            raise ValueError("target must be positive")
-        base, quote = self._split_pair(pair)
-        conn = connect_db(self.db_path)
+
+class CachedProvider:
+    """JSON-file cache with TTL around another provider.
+
+    Each base currency gets a table plus a fetch timestamp; historical
+    snapshots are appended so :meth:`FxService.trend` can work offline.
+    """
+
+    def __init__(
+        self,
+        inner: RateProvider,
+        cache_path: str | Path | None = None,
+        ttl: int | None = None,
+    ) -> None:
+        self.inner = inner
+        self.cache_path = Path(cache_path) if cache_path else Path(config.FX_CACHE_PATH)
+        self.ttl = ttl if ttl is not None else config.FX_CACHE_TTL
+
+    # -- cache IO ---------------------------------------------------------
+    def _load(self) -> dict:
+        if not self.cache_path.exists():
+            return {}
         try:
-            cur = conn.execute(
-                "INSERT INTO rate_alerts(pair, base, quote, target, direction,"
-                " note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (f"{base}/{quote}", base, quote, target, direction, note, now_ts()),
-            )
-            conn.commit()
-            return self.get(cur.lastrowid)
-        finally:
-            conn.close()
+            return json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
 
-    def get(self, alert_id: int) -> dict:
-        conn = connect_db(self.db_path)
+    def _save(self, data: dict) -> None:
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.cache_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(self.cache_path)
+
+    def store_snapshot(self, base: str, table: dict[str, float]) -> None:
+        """Manually record a rate table (used by tests and seed scripts)."""
+        data = self._load()
+        key = base.upper()
+        data.setdefault(key, {"fetched_at": 0, "table": {}, "history": []})
+        entry = data[key]
+        entry["fetched_at"] = int(time.time())
+        entry["table"] = {k.upper(): float(v) for k, v in table.items()}
+        entry["history"].append(
+            {"ts": int(time.time()), "table": entry["table"]}
+        )
+        entry["history"] = entry["history"][-60:]  # keep last 60 snapshots
+        self._save(data)
+
+    # -- protocol ---------------------------------------------------------
+    def get_table(self, base: str) -> dict[str, float]:
+        base = base.upper()
+        data = self._load()
+        entry = data.get(base)
+        now = int(time.time())
+        if entry and now - entry.get("fetched_at", 0) < self.ttl:
+            return dict(entry["table"])
+        fresh = self.inner.get_table(base)  # may raise FxError
+        self.store_snapshot(base, fresh)
+        return dict(fresh)
+
+    def history(self, base: str) -> list[dict]:
+        data = self._load()
+        return list(data.get(base.upper(), {}).get("history", []))
+
+
+class FallbackTableProvider:
+    """Static fallback rates loaded from a JSON file (data/fallback_rates.json)."""
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        path = Path(path) if path else Path(config.DATA_DIR) / "fallback_rates.json"
         try:
-            row = conn.execute(
-                "SELECT * FROM rate_alerts WHERE id = ?", (alert_id,)
-            ).fetchone()
-        finally:
-            conn.close()
-        if not row:
-            raise KeyError(f"alert {alert_id} not found")
-        return dict(row)
+            self.tables = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self.tables = {}
 
-    def list(self, active_only: bool = True) -> list[dict]:
-        conn = connect_db(self.db_path)
+    def get_table(self, base: str) -> dict[str, float]:
+        table = self.tables.get(base.upper())
+        if not table:
+            raise FxError(f"no fallback table for {base}")
+        return {k.upper(): float(v) for k, v in table.items()}
+
+
+class FxService:
+    """Rate lookup with provider -> cache -> fallback chaining."""
+
+    def __init__(
+        self,
+        live: RateProvider | None = None,
+        cache_path: str | Path | None = None,
+        fallback_path: str | Path | None = None,
+    ) -> None:
+        self.cached = CachedProvider(
+            live or SimpleApiProvider(), cache_path=cache_path
+        )
+        self.fallback = FallbackTableProvider(path=fallback_path)
+
+    def _table(self, base: str) -> dict[str, float]:
+        base = base.upper()
         try:
-            q = "SELECT * FROM rate_alerts"
-            if active_only:
-                q += " WHERE active = 1"
-            q += " ORDER BY id"
-            return [dict(r) for r in conn.execute(q)]
-        finally:
-            conn.close()
+            return self.cached.get_table(base)
+        except FxError:
+            return self.fallback.get_table(base)
 
-    def deactivate(self, alert_id: int) -> None:
-        conn = connect_db(self.db_path)
-        try:
-            conn.execute("UPDATE rate_alerts SET active = 0 WHERE id = ?", (alert_id,))
-            conn.commit()
-        finally:
-            conn.close()
+    def get_rate(self, base: str, quote: str) -> float:
+        """Units of ``quote`` per one ``base``."""
+        base, quote = base.upper(), quote.upper()
+        if base == quote:
+            return 1.0
+        table = self._table(base)
+        rate = table.get(quote)
+        if rate is None or rate <= 0:
+            raise FxError(f"no rate for {base}->{quote}")
+        return float(rate)
 
-    @staticmethod
-    def _split_pair(pair: str) -> tuple[str, str]:
-        pair = pair.upper().replace("-", "/").replace(" ", "")
-        parts = pair.split("/")
-        if len(parts) != 2 or not all(parts):
-            raise ValueError("pair must look like USD/CNY")
-        if parts[0] not in config.SUPPORTED_CURRENCIES or parts[1] not in config.SUPPORTED_CURRENCIES:
-            raise ValueError(f"unsupported currency in pair {pair}")
-        return parts[0], parts[1]
+    def convert(self, amount: float, base: str, quote: str) -> float:
+        return float(amount) * self.get_rate(base, quote)
 
-    # -- evaluation -------------------------------------------------------
-    def check(self, cooldown: int | None = None) -> list[dict]:
-        """Evaluate all active alerts; notify for triggered ones (cooldown-aware)."""
-        cooldown = config.ALERT_COOLDOWN if cooldown is None else cooldown
-        triggered: list[dict] = []
-        for alert in self.list():
-            if now_ts() - alert["last_triggered_at"] < cooldown:
-                continue
-            try:
-                rate = self.fx.get_rate(alert["base"], alert["quote"])
-            except Exception:
-                continue  # rate unavailable; try next cycle
-            hit = (
-                rate >= alert["target"]
-                if alert["direction"] == "above"
-                else rate <= alert["target"]
-            )
-            if not hit:
-                continue
-            self._record_trigger(alert["id"], rate)
-            subject = (
-                f"Rate alert: {alert['pair']} {alert['direction']} {alert['target']}"
-            )
-            message = (
-                f"{alert['pair']} is now {rate:.4f}, which is {alert['direction']}"
-                f" your target of {alert['target']:.4f}."
-                + (f" Note: {alert['note']}" if alert["note"] else "")
-            )
-            sent = [n.notify(subject, message) for n in self.notifiers]
-            triggered.append(
-                {**alert, "rate": rate, "notified": any(sent)}
-            )
-        return triggered
-
-    def _record_trigger(self, alert_id: int, rate: float) -> None:
-        conn = connect_db(self.db_path)
-        try:
-            conn.execute(
-                "UPDATE rate_alerts SET last_triggered_at = ? WHERE id = ?",
-                (now_ts(), alert_id),
-            )
-            conn.execute(
-                "INSERT INTO alert_events(alert_id, rate, triggered_at)"
-                " VALUES (?, ?, ?)",
-                (alert_id, rate, now_ts()),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    def events(self, limit: int = 50) -> list[dict]:
-        conn = connect_db(self.db_path)
-        try:
-            return [
-                dict(r)
-                for r in conn.execute(
-                    "SELECT * FROM alert_events ORDER BY triggered_at DESC LIMIT ?",
-                    (limit,),
-                )
-            ]
-        finally:
-            conn.close()
+    def trend(self, base: str, quote: str, days: int | None = None) -> dict:
+        """Simple trend summary from cached history (offline-safe)."""
+        days = days if days is not None else config.FX_TREND_DAYS
+        base, quote = base.upper(), quote.upper()
+        points = []
+        for snap in self.cached.history(base)[-max(days, 1) * 4 :]:
+            rate = snap["table"].get(quote)
+            if rate:
+                points.append({"ts": snap["ts"], "rate": float(rate)})
+        if not points:
+            current = self.get_rate(base, quote)
+            return {
+                "pair": f"{base}/{quote}",
+                "current": current,
+                "change_pct": 0.0,
+                "direction": "flat",
+                "points": [],
+            }
+        first, last = points[0]["rate"], points[-1]["rate"]
+        change_pct = (last - first) / first * 100 if first else 0.0
+        direction = "up" if change_pct > 0.05 else "down" if change_pct < -0.05 else "flat"
+        return {
+            "pair": f"{base}/{quote}",
+            "current": self.get_rate(base, quote),
+            "change_pct": round(change_pct, 2),
+            "direction": direction,
+            "points": points,
+        }
