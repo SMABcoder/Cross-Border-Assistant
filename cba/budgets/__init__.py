@@ -1,39 +1,37 @@
-"""Tuition payment reminders with step-by-step guidance attached."""
+"""Monthly budgets: totals + per-category limits, warnings and burn-down pace."""
 from __future__ import annotations
 
+import calendar
 from datetime import date
 from pathlib import Path
 
 import config
-from cba.common import connect_db, fmt_money, today_iso
+from cba.common import connect_db, fmt_money, month_key
+from cba.ledger import LedgerService
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS tuition_bills (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    amount REAL NOT NULL CHECK (amount > 0),
+CREATE TABLE IF NOT EXISTS budgets (
+    month TEXT NOT NULL,
+    category TEXT NOT NULL,
+    limit_amount REAL NOT NULL CHECK (limit_amount > 0),
     currency TEXT NOT NULL,
-    due_date TEXT NOT NULL,
-    payee TEXT NOT NULL DEFAULT '',
-    guide_ref TEXT NOT NULL DEFAULT 'pay_tuition',
-    paid INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tuition_notifications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    bill_id INTEGER NOT NULL REFERENCES tuition_bills(id),
-    kind TEXT NOT NULL,
-    notified_on TEXT NOT NULL,
-    UNIQUE (bill_id, kind, notified_on)
+    PRIMARY KEY (month, category)
 );
 """
 
 
-class TuitionService:
-    """CRUD tuition bills and compute due-date notifications."""
+class BudgetService:
+    """Set monthly budgets and report status with warnings and pace projection."""
 
-    def __init__(self, db_path: str | Path | None = None) -> None:
+    TOTAL_KEY = "__total__"
+
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        ledger: LedgerService | None = None,
+    ) -> None:
         self.db_path = Path(db_path) if db_path else Path(config.DB_PATH)
+        self.ledger = ledger or LedgerService(db_path=self.db_path)
         conn = connect_db(self.db_path)
         try:
             conn.executescript(_SCHEMA)
@@ -41,155 +39,130 @@ class TuitionService:
         finally:
             conn.close()
 
-    # -- CRUD -------------------------------------------------------------
-    def add(
+    # -- writes -----------------------------------------------------------
+    def set_budget(
         self,
-        name: str,
-        amount: float,
-        currency: str,
-        due_date: str,
-        payee: str = "",
-        guide_ref: str = "pay_tuition",
-    ) -> dict:
-        amount = float(amount)
-        if amount <= 0:
-            raise ValueError("amount must be positive")
-        date.fromisoformat(due_date)  # validate
-        currency = currency.upper()
-        if currency not in config.SUPPORTED_CURRENCIES:
-            raise ValueError(f"unsupported currency {currency}")
+        year: int,
+        month: int,
+        limit_amount: float,
+        currency: str | None = None,
+        category: str | None = None,
+    ) -> None:
+        """Set the overall monthly budget, or a per-category limit."""
+        limit_amount = float(limit_amount)
+        if limit_amount <= 0:
+            raise ValueError("budget limit must be positive")
+        currency = (currency or config.APP_CURRENCY).upper()
+        key = self.TOTAL_KEY if category is None else category.lower()
         conn = connect_db(self.db_path)
         try:
-            cur = conn.execute(
-                "INSERT INTO tuition_bills(name, amount, currency, due_date,"
-                " payee, guide_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (name, amount, currency, due_date, payee, guide_ref, today_iso()),
+            conn.execute(
+                "INSERT OR REPLACE INTO budgets(month, category, limit_amount, currency)"
+                " VALUES (?, ?, ?, ?)",
+                (month_key(year, month), key, limit_amount, currency),
             )
             conn.commit()
-            return self.get(cur.lastrowid)
         finally:
             conn.close()
 
-    def get(self, bill_id: int) -> dict:
+    def get_budgets(self, year: int, month: int) -> dict[str, dict]:
         conn = connect_db(self.db_path)
         try:
-            row = conn.execute(
-                "SELECT * FROM tuition_bills WHERE id = ?", (bill_id,)
-            ).fetchone()
+            rows = conn.execute(
+                "SELECT category, limit_amount, currency FROM budgets WHERE month = ?",
+                (month_key(year, month),),
+            ).fetchall()
         finally:
             conn.close()
-        if not row:
-            raise KeyError(f"bill {bill_id} not found")
-        return dict(row)
+        return {
+            r["category"]: {
+                "limit": float(r["limit_amount"]),
+                "currency": r["currency"],
+            }
+            for r in rows
+        }
 
-    def list(self, include_paid: bool = False) -> list[dict]:
-        conn = connect_db(self.db_path)
-        try:
-            q = "SELECT * FROM tuition_bills"
-            if not include_paid:
-                q += " WHERE paid = 0"
-            q += " ORDER BY due_date"
-            return [dict(r) for r in conn.execute(q)]
-        finally:
-            conn.close()
-
-    def mark_paid(self, bill_id: int) -> None:
-        conn = connect_db(self.db_path)
-        try:
-            conn.execute("UPDATE tuition_bills SET paid = 1 WHERE id = ?", (bill_id,))
-            conn.commit()
-        finally:
-            conn.close()
-
-    def delete(self, bill_id: int) -> None:
-        conn = connect_db(self.db_path)
-        try:
-            conn.execute("DELETE FROM tuition_notifications WHERE bill_id = ?", (bill_id,))
-            conn.execute("DELETE FROM tuition_bills WHERE id = ?", (bill_id,))
-            conn.commit()
-        finally:
-            conn.close()
-
-    # -- notifications ----------------------------------------------------
-    def due_notifications(
+    # -- status -----------------------------------------------------------
+    def status(
         self,
+        year: int,
+        month: int,
+        base_currency: str | None = None,
         today: date | None = None,
-        thresholds: list[int] | None = None,
-    ) -> list[dict]:
-        """Build the notification list for unpaid bills.
+    ) -> dict:
+        base_currency = (base_currency or config.APP_CURRENCY).upper()
+        budgets = self.get_budgets(year, month)
+        summary = self.ledger.summary(year, month, base_currency)
+        spent = summary["expense"]
 
-        Fires at ``thresholds`` days-before, plus due-today and overdue.
-        Each notification carries a ``kind`` so a caller can de-duplicate
-        (kind + date is unique per bill in the DB).
-        """
-        today = today or date.today()
-        thresholds = (
-            list(config.TUITION_REMINDER_THRESHOLDS)
-            if thresholds is None
-            else list(thresholds)
-        )
-        notifications: list[dict] = []
-        for bill in self.list():
-            due = date.fromisoformat(bill["due_date"])
-            days_left = (due - today).days
-            kind: str | None = None
-            if days_left < 0:
-                kind = "overdue"
-            elif days_left == 0:
-                kind = "due_today"
-            elif days_left in thresholds:
-                kind = f"due_in_{days_left}"
-            if kind is None:
+        total = budgets.get(self.TOTAL_KEY)
+        result: dict = {
+            "month": month_key(year, month),
+            "base_currency": base_currency,
+            "warnings": [],
+        }
+
+        # Overall budget ----------------------------------------------
+        if total:
+            limit_base = self.ledger.fx.convert(
+                total["limit"], total["currency"], base_currency
+            )
+            pct = spent / limit_base * 100 if limit_base else 0.0
+            result["total"] = {
+                "limit": round(limit_base, 2),
+                "spent": round(spent, 2),
+                "remaining": round(limit_base - spent, 2),
+                "pct": round(pct, 1),
+            }
+            if pct >= config.BUDGET_BREACH_PCT:
+                result["warnings"].append(
+                    f"Over budget: spent {fmt_money(spent, base_currency)}"
+                    f" of {fmt_money(limit_base, base_currency)} ({pct:.0f}%)."
+                )
+            elif pct >= config.BUDGET_WARN_PCT:
+                result["warnings"].append(
+                    f"Warning: {pct:.0f}% of monthly budget used"
+                    f" ({fmt_money(spent, base_currency)} of"
+                    f" {fmt_money(limit_base, base_currency)})."
+                )
+            # Burn-down pace -------------------------------------------
+            today = today or date.today()
+            days_in_month = calendar.monthrange(year, month)[1]
+            elapsed = max(today.day, 1) if (today.year, today.month) == (year, month) else days_in_month
+            projected = spent / elapsed * days_in_month if elapsed else spent
+            result["pace"] = {
+                "day": today.day if (today.year, today.month) == (year, month) else days_in_month,
+                "days_in_month": days_in_month,
+                "projected_month_end": round(projected, 2),
+                "message": (
+                    f"At this pace you will spend {fmt_money(projected, base_currency)}"
+                    f" by month-end (budget {fmt_money(limit_base, base_currency)})."
+                ),
+            }
+        else:
+            result["total"] = {"limit": None, "spent": round(spent, 2),
+                               "remaining": None, "pct": None}
+
+        # Per-category limits ------------------------------------------
+        per_category = {}
+        for cat, b in budgets.items():
+            if cat == self.TOTAL_KEY:
                 continue
-            notifications.append(
-                {
-                    "bill": bill,
-                    "kind": kind,
-                    "days_left": days_left,
-                    "message": self._message(bill, kind, days_left),
-                    "guide_ref": bill["guide_ref"] or "pay_tuition",
-                }
-            )
-        return notifications
-
-    @staticmethod
-    def _message(bill: dict, kind: str, days_left: int) -> str:
-        amount = fmt_money(bill["amount"], bill["currency"])
-        who = f" to {bill['payee']}" if bill["payee"] else ""
-        if kind == "overdue":
-            return (
-                f"OVERDUE: {bill['name']} of {amount}{who} was due"
-                f" {abs(days_left)} day(s) ago ({bill['due_date']}). Pay now to"
-                " avoid late fees."
-            )
-        if kind == "due_today":
-            return f"DUE TODAY: {bill['name']} of {amount}{who}. Complete payment today."
-        return (
-            f"Reminder: {bill['name']} of {amount}{who} is due in"
-            f" {days_left} day(s) ({bill['due_date']})."
-        )
-
-    def record_sent(self, bill_id: int, kind: str, notified_on: str | None = None) -> bool:
-        """Mark a notification as sent; returns False if already recorded."""
-        notified_on = notified_on or today_iso()
-        conn = connect_db(self.db_path)
-        try:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO tuition_notifications(bill_id, kind, notified_on)"
-                " VALUES (?, ?, ?)",
-                (bill_id, kind, notified_on),
-            )
-            conn.commit()
-            return cur.rowcount == 1
-        finally:
-            conn.close()
-
-    def pending_notifications(
-        self, today: date | None = None, thresholds: list[int] | None = None
-    ) -> list[dict]:
-        """Notifications that have not been recorded as sent yet."""
-        pending = []
-        for n in self.due_notifications(today=today, thresholds=thresholds):
-            if self.record_sent(n["bill"]["id"], n["kind"]):
-                pending.append(n)
-        return pending
+            limit_base = self.ledger.fx.convert(b["limit"], b["currency"], base_currency)
+            cat_spent = summary["by_category"].get(cat, 0.0)
+            pct = cat_spent / limit_base * 100 if limit_base else 0.0
+            per_category[cat] = {
+                "limit": round(limit_base, 2),
+                "spent": round(cat_spent, 2),
+                "pct": round(pct, 1),
+            }
+            if pct >= config.BUDGET_BREACH_PCT:
+                result["warnings"].append(
+                    f"'{cat}' over limit: {pct:.0f}% used."
+                )
+            elif pct >= config.BUDGET_WARN_PCT:
+                result["warnings"].append(
+                    f"'{cat}' at {pct:.0f}% of its limit."
+                )
+        result["per_category"] = per_category
+        return result
