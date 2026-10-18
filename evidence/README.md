@@ -20,8 +20,7 @@ below was produced by running the real code — nothing is staged.
 - **`CrossBorderAssistant-Evidence-4min-Narrated.mp4`** — ~4-minute narrated
   evidence walkthrough: live terminal runs of every feature (real CLI,
   throwaway DB), the real-time LLM rephrasing a tuition answer live, the
-  web chat UI, the sandbox logs, and the 263-test suite. Rendered by
-  `scripts/record_evidence_video.py` (narration: casper voice) —
+  web chat UI, the sandbox logs, and the 263-test suite —
   **this is the recommended video for judges.**
 - `CrossBorderAssistant-Demo.mp4` — 50-second silent walkthrough, 1080p
   (earlier cut; superseded by the 4-minute video)
@@ -50,7 +49,6 @@ cd Cross-Border-Assistant
 python scripts/demo.py            # Phase-1 evidence log -> evidence/
 python scripts/evidence_phase2.py # Phase-2 evidence log -> evidence/
 python -m unittest discover -s tests   # 263 tests, offline, ~1 second
-python scripts/record_evidence_video.py  # re-render the 4-min evidence video
 ```
 
 Every script uses a temporary database and a mocked/offline FX provider:
