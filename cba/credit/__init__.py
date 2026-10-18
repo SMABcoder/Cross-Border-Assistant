@@ -1,118 +1,181 @@
-"""Forecasting: weighted moving average + trend over past months."""
+"""Credit-building guidance + checklist tracker.
+
+Honest scope: this module provides educational guidance and a
+progress checklist persisted in sqlite. It does NOT connect to any
+credit bureau or lender API (see roadmap in README.md).
+
+Score estimator: ``CreditService.estimate_score()`` is a transparent,
+clearly-labeled ESTIMATE derived only from checklist progress — it shows
+its math in the result dict and carries a disclaimer that it is not a
+bureau score. Production bureau integrations are represented by
+``BureauAdapter`` (a Protocol) with an inert placeholder
+``InertBaihangAdapter`` for Baihang Credit (百行征信); ``fetch_report``
+raises ``ProductionGatedError`` because this prototype never contacts
+credit bureaus and handles no identity documents.
+"""
 from __future__ import annotations
 
-from datetime import date
+import json
 from pathlib import Path
+from typing import Protocol
 
 import config
-from cba.common import connect_db, fmt_money
-from cba.ledger import LedgerService
+from cba.common import ProductionGatedError, connect_db
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS credit_checklist (
+    item_key TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0,
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
+"""
 
 
-class ForecastService:
-    """Project month-end spending from recent history."""
+class CreditService:
+    """Track credit-building checklist progress."""
 
     def __init__(
         self,
         db_path: str | Path | None = None,
-        ledger: LedgerService | None = None,
+        checklist_path: str | Path | None = None,
     ) -> None:
         self.db_path = Path(db_path) if db_path else Path(config.DB_PATH)
-        self.ledger = ledger or LedgerService(db_path=self.db_path)
-
-    def _past_months(self, year: int, month: int, n: int) -> list[tuple[int, int]]:
-        months = []
-        y, m = year, month
-        for _ in range(n):
-            m -= 1
-            if m == 0:
-                m, y = 12, y - 1
-            months.append((y, m))
-        return months
-
-    def _monthly_expense(
-        self, year: int, month: int, base_currency: str, category: str | None
-    ) -> float:
-        summary = self.ledger.summary(year, month, base_currency)
-        if category:
-            return float(summary["by_category"].get(category.lower(), 0.0))
-        return float(summary["expense"])
-
-    def monthly_projection(
-        self,
-        year: int | None = None,
-        month: int | None = None,
-        base_currency: str | None = None,
-        category: str | None = None,
-        months: int | None = None,
-    ) -> dict:
-        """Weighted projection of the current month's total expense.
-
-        Weights recent months more heavily (``CBA_FORECAST_RECENT_WEIGHT``),
-        adds a linear trend adjustment, and compares against the budget.
-        """
-        base_currency = (base_currency or config.APP_CURRENCY).upper()
-        months = months if months is not None else config.FORECAST_MONTHS
-        months = max(months, 2)
-        today = date.today()
-        year = year or today.year
-        month = month or today.month
-
-        history = [
-            self._monthly_expense(y, m, base_currency, category)
-            for y, m in self._past_months(year, month, months)
-        ]
-        # Most recent month first in `history`; apply geometric weights.
-        w_recent = float(config.FORECAST_RECENT_WEIGHT)
-        weights, remaining, w = [], 1.0, w_recent
-        for _ in history:
-            weights.append(w)
-            remaining -= w
-            w *= (1 - w_recent) if w_recent < 1 else 0.5
-        # Normalize remaining weight onto the oldest month.
-        if remaining > 0 and weights:
-            weights[-1] += remaining
-
-        weighted_avg = sum(h * wt for h, wt in zip(history, weights))
-        # Linear trend: slope of (oldest -> newest) per month.
-        slope = (history[0] - history[-1]) / max(len(history) - 1, 1)
-        projected = max(weighted_avg + slope, 0.0)
-
-        verdict = "on track"
-        over_by = 0.0
-        budget_limit: float | None = None
+        self.checklist_path = (
+            Path(checklist_path)
+            if checklist_path
+            else Path(config.DATA_DIR) / "credit_checklist.json"
+        )
+        conn = connect_db(self.db_path)
         try:
-            from cba.budgets import BudgetService
+            conn.executescript(_SCHEMA)
+            conn.commit()
+        finally:
+            conn.close()
+        self._seed_defaults()
 
-            budgets = BudgetService(db_path=self.db_path, ledger=self.ledger)
-            status = budgets.status(year, month, base_currency)
-            if status["total"]["limit"] is not None:
-                budget_limit = float(status["total"]["limit"])
-                if projected > budget_limit:
-                    verdict = "will exceed budget"
-                    over_by = projected - budget_limit
-        except Exception:
-            pass
+    def _defaults(self) -> list[dict]:
+        try:
+            payload = json.loads(self.checklist_path.read_text(encoding="utf-8"))
+            return payload.get("items", [])
+        except (OSError, json.JSONDecodeError):
+            return []
 
-        scope = category.lower() if category else "all spending"
-        return {
-            "month": f"{year:04d}-{month:02d}",
-            "scope": scope,
-            "base_currency": base_currency,
-            "history_months": months,
-            "history": [round(h, 2) for h in history],
-            "projected": round(projected, 2),
-            "budget_limit": round(budget_limit, 2) if budget_limit else None,
-            "verdict": verdict,
-            "over_by": round(over_by, 2),
-            "message": (
-                f"Projected {scope} for {year:04d}-{month:02d}:"
-                f" {fmt_money(projected, base_currency)}."
-                + (
-                    f" You will exceed your budget by"
-                    f" {fmt_money(over_by, base_currency)}."
-                    if verdict == "will exceed budget"
-                    else " You are on track."
+    def _seed_defaults(self) -> None:
+        conn = connect_db(self.db_path)
+        try:
+            for item in self._defaults():
+                conn.execute(
+                    "INSERT OR IGNORE INTO credit_checklist(item_key, label, sort_order)"
+                    " VALUES (?, ?, ?)",
+                    (item["key"], item["label"], item.get("sort", 0)),
                 )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def items(self) -> list[dict]:
+        conn = connect_db(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT item_key, label, done, sort_order FROM credit_checklist"
+                " ORDER BY sort_order, item_key"
+            ).fetchall()
+        finally:
+            conn.close()
+        return [
+            {"key": r["item_key"], "label": r["label"], "done": bool(r["done"])}
+            for r in rows
+        ]
+
+    def complete(self, key: str) -> dict:
+        return self._set(key, True)
+
+    def uncomplete(self, key: str) -> dict:
+        return self._set(key, False)
+
+    def _set(self, key: str, done: bool) -> dict:
+        conn = connect_db(self.db_path)
+        try:
+            cur = conn.execute(
+                "UPDATE credit_checklist SET done = ? WHERE item_key = ?",
+                (1 if done else 0, key),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if cur.rowcount == 0:
+            raise KeyError(f"unknown checklist item '{key}'")
+        return {"key": key, "done": done}
+
+    def reset(self) -> None:
+        conn = connect_db(self.db_path)
+        try:
+            conn.execute("UPDATE credit_checklist SET done = 0")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def progress(self) -> dict:
+        items = self.items()
+        done = sum(1 for i in items if i["done"])
+        total = len(items)
+        pct = round(done / total * 100, 1) if total else 0.0
+        return {
+            "done": done,
+            "total": total,
+            "pct": pct,
+            "remaining": [i for i in items if not i["done"]],
+        }
+
+    def estimate_score(self) -> dict:
+        """Return a transparent, clearly-labeled checklist-progress score ESTIMATE.
+
+        This is a rough educational estimate from checklist progress only —
+        it is NOT a bureau score. The result shows its full math and carries
+        an explicit disclaimer. Tunables are read from ``config`` inside this
+        method so tests may monkeypatch them.
+        """
+        prog = self.progress()
+        done = prog["done"]
+        total = prog["total"]
+        base = config.CREDIT_ESTIMATE_BASE
+        per = config.CREDIT_ESTIMATE_PER_ITEM
+        cap = config.CREDIT_ESTIMATE_MAX
+        raw = base + done * per
+        estimate = min(raw, cap)
+        return {
+            "estimate": estimate,
+            "base": base,
+            "points_per_item": per,
+            "items_done": done,
+            "items_total": total,
+            "max": cap,
+            "math": (
+                f"{base} + {done} completed x {per} pts = {raw}"
+                f" -> capped at {cap} = {estimate}"
+            ),
+            "disclaimer": (
+                "Rough educational estimate from your checklist progress only. "
+                "Not a bureau score — lenders and bureaus use their own "
+                "models and data."
             ),
         }
+
+
+class BureauAdapter(Protocol):
+    """Production interface for bureau data — inert in this prototype."""
+
+    def fetch_report(self, subject_id: str) -> dict:
+        ...  # pragma: no cover
+
+
+class InertBaihangAdapter:
+    """Inert stand-in for a Baihang Credit (百行征信) integration."""
+
+    def fetch_report(self, subject_id: str) -> dict:
+        """Never contacts a bureau; raises because this is production-gated."""
+        raise ProductionGatedError(
+            "Baihang/bureau integration is production-gated: this prototype "
+            "never contacts credit bureaus and handles no identity documents."
+        )
