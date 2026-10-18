@@ -1,225 +1,239 @@
-"""The friendly student finance assistant: chat in, answers out.
+"""Forecasting: weighted moving average + trend over past months.
 
-Rule-based and deterministic. Every number comes from FxService, the
-ledger, budgets, tuition or the fee table -- never invented.
+Extends the plain projection with two additions:
+
+- **Monthly seasonality index** — the plain projection is scaled by the
+  historical share of the target calendar month (average expense in that
+  calendar month across the trailing ``FORECAST_SEASONALITY_MONTHS``
+  months, divided by the overall average monthly expense). This is pure
+  arithmetic on historical totals, not a learned model. It engages only
+  when the ledger spans at least ``FORECAST_MIN_HISTORY_DAYS`` days and
+  ``FORECAST_MIN_HISTORY_MONTHS`` distinct calendar months; otherwise
+  the factor is exactly 1.0 and the projection is unchanged.
+- **Per-category daily burn** — average daily spend for one category
+  over a trailing window (``category_daily_burn``).
+
+Config values are read inside the methods so tests can monkeypatch
+them. Stdlib only.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import config
-from cba.alerts import AlertService
-from cba.assistant import i18n
-from cba.assistant.guides import GuideBook
-from cba.assistant.intents import IntentParser
-from cba.assistant.llm import LLMProvider
-from cba.budgets import BudgetService
-from cba.common import fmt_money
-from cba.credit import CreditService
-from cba.forecast import ForecastService
-from cba.fx import FxService
+from cba.common import connect_db, fmt_money
 from cba.ledger import LedgerService
-from cba.transfers import FeeEstimator
-from cba.tuition import TuitionService
 
 
-class Assistant:
-    """Conversational front-end over all Phase-1 services."""
+class ForecastService:
+    """Project month-end spending from recent history.
+
+    The core projection is a weighted moving average plus a linear
+    trend. A simple historical seasonality index can scale it when
+    enough history exists. The index is arithmetic on past monthly
+    totals — a transparent seasonal multiplier, not ML.
+    """
 
     def __init__(
         self,
         db_path: str | Path | None = None,
-        fx: FxService | None = None,
-        lang: str | None = None,
-        llm: LLMProvider | None = None,
+        ledger: LedgerService | None = None,
     ) -> None:
         self.db_path = Path(db_path) if db_path else Path(config.DB_PATH)
-        self.lang = lang or config.DEFAULT_LANG
-        self.parser = IntentParser()
-        self.guides = GuideBook()
-        self.fx = fx or FxService()
-        self.ledger = LedgerService(db_path=self.db_path, fx=self.fx)
-        self.budgets = BudgetService(db_path=self.db_path, ledger=self.ledger)
-        self.alerts = AlertService(db_path=self.db_path, fx=self.fx)
-        self.tuition = TuitionService(db_path=self.db_path)
-        self.transfers = FeeEstimator(fx=self.fx)
-        self.credit = CreditService(db_path=self.db_path)
-        self.forecast = ForecastService(db_path=self.db_path, ledger=self.ledger)
-        self.llm = llm if config.LLM_ENABLED else None
+        self.ledger = ledger or LedgerService(db_path=self.db_path)
 
-    # -- entry point ------------------------------------------------------
-    def chat(self, text: str, lang: str | None = None, context: dict | None = None) -> str:
-        lang = lang or self.lang
-        intent = self.parser.parse(text)
-        handler = {
-            "convert": self._h_convert,
-            "budget_status": self._h_budget,
-            "set_rate_alert": self._h_alert,
-            "tuition_due": self._h_tuition,
-            "transfer_advice": self._h_transfer,
-            "credit_advice": self._h_credit,
-            "guide": self._h_guide,
-            "forecast": self._h_forecast,
-            "help": self._h_help,
-        }.get(intent.name, self._h_help)
-        reply = handler(intent, lang, context or {})
-        if self.llm is not None:
+    def _past_months(self, year: int, month: int, n: int) -> list[tuple[int, int]]:
+        months = []
+        y, m = year, month
+        for _ in range(n):
+            m -= 1
+            if m == 0:
+                m, y = 12, y - 1
+            months.append((y, m))
+        return months
+
+    def _monthly_expense(
+        self, year: int, month: int, base_currency: str, category: str | None
+    ) -> float:
+        summary = self.ledger.summary(year, month, base_currency)
+        if category:
+            return float(summary["by_category"].get(category.lower(), 0.0))
+        return float(summary["expense"])
+
+    def _seasonality_factor(
+        self,
+        year: int,
+        month: int,
+        base_currency: str,
+        category: str | None,
+    ) -> float:
+        """Seasonal multiplier for calendar ``month`` (1-12).
+
+        The index for calendar month m is (average expense in month m
+        across the trailing ``FORECAST_SEASONALITY_MONTHS`` months) /
+        (overall average monthly expense over that window). Applies only
+        when the ledger covers at least ``FORECAST_MIN_HISTORY_MONTHS``
+        distinct calendar months and ``FORECAST_MIN_HISTORY_DAYS`` days;
+        otherwise returns exactly 1.0. Also 1.0 when there is no
+        expense at all or no data for the target calendar month.
+        """
+        span = int(config.FORECAST_SEASONALITY_MONTHS)
+        min_days = int(config.FORECAST_MIN_HISTORY_DAYS)
+        min_months = int(config.FORECAST_MIN_HISTORY_MONTHS)
+
+        conn = connect_db(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT min(date), max(date),"
+                " count(DISTINCT substr(date, 1, 7)) FROM transactions"
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None or row[0] is None or row[1] is None:
+            return 1.0
+        day_span = (date.fromisoformat(row[1]) - date.fromisoformat(row[0])).days
+        if int(row[2]) < min_months or day_span < min_days:
+            return 1.0
+
+        window = self._past_months(year, month, span)
+        totals = [
+            self._monthly_expense(y, m, base_currency, category) for y, m in window
+        ]
+        overall = sum(totals) / len(totals) if totals else 0.0
+        if overall <= 0:
+            return 1.0
+        sums: dict[int, float] = {}
+        counts: dict[int, int] = {}
+        for (_, m), total in zip(window, totals):
+            if total > 0:
+                sums[m] = sums.get(m, 0.0) + total
+                counts[m] = counts.get(m, 0) + 1
+        if month not in sums:
+            return 1.0
+        return float((sums[month] / counts[month]) / overall)
+
+    def category_daily_burn(
+        self,
+        category: str,
+        days: int | None = None,
+        base_currency: str | None = None,
+    ) -> dict:
+        """Average daily spend for ``category`` over the trailing ``days``.
+
+        ``days`` defaults to ``FORECAST_MONTHS * 30``. Amounts are
+        converted to ``base_currency`` (default ``APP_CURRENCY``);
+        transactions that fail FX conversion are skipped, consistent
+        with ledger summaries.
+        """
+        base_currency = (base_currency or config.APP_CURRENCY).upper()
+        days = int(config.FORECAST_MONTHS * 30) if days is None else int(days)
+        days = max(days, 1)
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        total = 0.0
+        for r in self.ledger.list(kind="expense", category=category, limit=100000):
+            if r["date"] < cutoff:
+                continue
             try:
-                reply = self.llm.complete(
-                    "You are a friendly student finance assistant. Keep numbers exact.",
-                    f"User said: {text}\nDraft answer: {reply}\n"
-                    "Rephrase warmly without changing any numbers.",
+                total += float(
+                    self.ledger.fx.convert(r["amount"], r["currency"], base_currency)
                 )
             except Exception:
-                pass
-        return reply
+                continue
+        total = round(total, 2)
+        return {
+            "category": (category or "").lower(),
+            "days": days,
+            "total": total,
+            "daily_burn": round(total / days, 2),
+            "base_currency": base_currency,
+        }
 
-    # -- handlers ---------------------------------------------------------
-    def _h_convert(self, intent, lang, context) -> str:
-        e = intent.entities
-        try:
-            result = self.fx.convert(e["amount"], e["from"], e["to"])
-            rate = self.fx.get_rate(e["from"], e["to"])
-        except Exception as exc:
-            return i18n.t("fx_unavailable", lang, error=exc)
-        out = [
-            i18n.t(
-                "converted", lang,
-                amount=fmt_money(e["amount"], e["from"]),
-                result=fmt_money(result, e["to"]),
-                rate=f"{rate:.4f}",
-                base=e["from"], quote=e["to"],
-            )
+    def monthly_projection(
+        self,
+        year: int | None = None,
+        month: int | None = None,
+        base_currency: str | None = None,
+        category: str | None = None,
+        months: int | None = None,
+    ) -> dict:
+        """Weighted projection of the current month's total expense.
+
+        Weights recent months more heavily (``CBA_FORECAST_RECENT_WEIGHT``),
+        adds a linear trend adjustment, scales by the historical
+        seasonality index for the target calendar month (exactly 1.0
+        when history is too thin), and compares against the budget.
+        """
+        base_currency = (base_currency or config.APP_CURRENCY).upper()
+        months = months if months is not None else config.FORECAST_MONTHS
+        months = max(months, 2)
+        today = date.today()
+        year = year or today.year
+        month = month or today.month
+
+        history = [
+            self._monthly_expense(y, m, base_currency, category)
+            for y, m in self._past_months(year, month, months)
         ]
+        # Most recent month first in `history`; apply geometric weights.
+        w_recent = float(config.FORECAST_RECENT_WEIGHT)
+        weights, remaining, w = [], 1.0, w_recent
+        for _ in history:
+            weights.append(w)
+            remaining -= w
+            w *= (1 - w_recent) if w_recent < 1 else 0.5
+        # Normalize remaining weight onto the oldest month.
+        if remaining > 0 and weights:
+            weights[-1] += remaining
+
+        weighted_avg = sum(h * wt for h, wt in zip(history, weights))
+        # Linear trend: slope of (oldest -> newest) per month.
+        slope = (history[0] - history[-1]) / max(len(history) - 1, 1)
+        projected = max(weighted_avg + slope, 0.0)
+
+        # Seasonal adjustment: scale the plain projection by the
+        # historical index for this calendar month. Exactly 1.0 when
+        # history is too thin, so short-history projections are
+        # bit-for-bit identical to the pre-seasonality formula.
+        factor = self._seasonality_factor(year, month, base_currency, category)
+        projected = max(projected * factor, 0.0)
+
+        verdict = "on track"
+        over_by = 0.0
+        budget_limit: float | None = None
         try:
-            trend = self.fx.trend(e["from"], e["to"])
-            out.append(
-                i18n.t(
-                    "trend_note", lang,
-                    direction=trend["direction"], change=trend["change_pct"],
-                )
-            )
+            from cba.budgets import BudgetService
+
+            budgets = BudgetService(db_path=self.db_path, ledger=self.ledger)
+            status = budgets.status(year, month, base_currency)
+            if status["total"]["limit"] is not None:
+                budget_limit = float(status["total"]["limit"])
+                if projected > budget_limit:
+                    verdict = "will exceed budget"
+                    over_by = projected - budget_limit
         except Exception:
             pass
-        out.append(i18n.t("followup", lang, suggestion=i18n.t("suggest_alert", lang)))
-        return "\n".join(out)
 
-    def _h_budget(self, intent, lang, context) -> str:
-        today = date.today()
-        status = self.budgets.status(today.year, today.month)
-        lines = [i18n.t("budget_header", lang, month=status["month"])]
-        total = status["total"]
-        if total["limit"] is not None:
-            lines.append(
-                i18n.t(
-                    "budget_total", lang,
-                    spent=fmt_money(total["spent"], status["base_currency"]),
-                    limit=fmt_money(total["limit"], status["base_currency"]),
-                    pct=total["pct"],
+        scope = category.lower() if category else "all spending"
+        return {
+            "month": f"{year:04d}-{month:02d}",
+            "scope": scope,
+            "base_currency": base_currency,
+            "history_months": months,
+            "history": [round(h, 2) for h in history],
+            "projected": round(projected, 2),
+            "budget_limit": round(budget_limit, 2) if budget_limit else None,
+            "verdict": verdict,
+            "over_by": round(over_by, 2),
+            "seasonality_factor": round(factor, 3),
+            "message": (
+                f"Projected {scope} for {year:04d}-{month:02d}:"
+                f" {fmt_money(projected, base_currency)}."
+                + (
+                    f" You will exceed your budget by"
+                    f" {fmt_money(over_by, base_currency)}."
+                    if verdict == "will exceed budget"
+                    else " You are on track."
                 )
-            )
-        else:
-            lines.append(
-                i18n.t(
-                    "budget_no_limit", lang,
-                    spent=fmt_money(total["spent"], status["base_currency"]),
-                )
-            )
-        for w in status["warnings"]:
-            lines.append(f"⚠️ {w}")
-        if status.get("pace"):
-            lines.append(f"📈 {status['pace']['message']}")
-        lines.append(i18n.t("followup", lang, suggestion=i18n.t("suggest_forecast", lang)))
-        return "\n".join(lines)
-
-    def _h_alert(self, intent, lang, context) -> str:
-        e = intent.entities
-        if not e.get("base"):
-            return i18n.t("alert_format_help", lang)
-        try:
-            alert = self.alerts.create(
-                f"{e['base']}/{e['quote']}", e["target"], e["direction"]
-            )
-        except Exception as exc:
-            return i18n.t("alert_failed", lang, error=exc)
-        return i18n.t(
-            "alert_created", lang,
-            pair=alert["pair"], direction=alert["direction"],
-            target=f"{alert['target']:.4f}",
-        )
-
-    def _h_tuition(self, intent, lang, context) -> str:
-        bills = self.tuition.list()
-        if not bills:
-            return i18n.t("tuition_none", lang)
-        notes = {n["bill"]["id"]: n for n in self.tuition.due_notifications()}
-        lines = [i18n.t("tuition_header", lang)]
-        for b in bills:
-            n = notes.get(b["id"])
-            flag = f" — {n['message']}" if n else ""
-            lines.append(
-                f"• {b['name']}: {fmt_money(b['amount'], b['currency'])}"
-                f" due {b['due_date']}{flag}"
-            )
-        lines.append(i18n.t("followup", lang, suggestion=i18n.t("suggest_guide_tuition", lang)))
-        return "\n".join(lines)
-
-    def _h_transfer(self, intent, lang, context) -> str:
-        e = intent.entities
-        if not e.get("from") or not e.get("amount"):
-            return i18n.t("transfer_format_help", lang)
-        try:
-            ranked = self.transfers.compare(e["amount"], e["from"], e["to"])
-        except Exception as exc:
-            return i18n.t("transfer_failed", lang, error=exc)
-        lines = [
-            i18n.t(
-                "transfer_header", lang,
-                amount=fmt_money(e["amount"], e["from"]),
-                to=e["to"],
-            )
-        ]
-        for r in ranked[:3]:
-            lines.append(
-                f"• {r['method']}: {fmt_money(r['receive'], r['receive_ccy'])}"
-                f" (cost {fmt_money(r['total_cost'], r['total_cost_ccy'])},"
-                f" ETA {r['eta']})"
-            )
-        lines.append(i18n.t("followup", lang, suggestion=i18n.t("suggest_guide_transfer", lang)))
-        return "\n".join(lines)
-
-    def _h_credit(self, intent, lang, context) -> str:
-        prog = self.credit.progress()
-        lines = [i18n.t("credit_header", lang)]
-        lines.append(
-            i18n.t(
-                "credit_progress", lang,
-                done=prog["done"], total=prog["total"], pct=prog["pct"],
-            )
-        )
-        for item in self.credit.items():
-            mark = "✅" if item["done"] else "⬜"
-            lines.append(f"{mark} {item['label']} (`{item['key']}`)")
-        lines.append("")
-        lines.append(self.guides.render("credit_building", lang=lang))
-        lines.append(i18n.t("followup", lang, suggestion=i18n.t("suggest_credit", lang)))
-        return "\n".join(lines)
-
-    def _h_guide(self, intent, lang, context) -> str:
-        ref = intent.entities.get("guide")
-        if not ref:
-            available = ", ".join(g["ref"] for g in self.guides.list_guides())
-            return i18n.t("guide_list", lang, guides=available)
-        try:
-            return self.guides.render(ref, lang=lang)
-        except KeyError:
-            return i18n.t("guide_missing", lang, ref=ref)
-
-    def _h_forecast(self, intent, lang, context) -> str:
-        today = date.today()
-        proj = self.forecast.monthly_projection(today.year, today.month)
-        return f"🔮 {proj['message']}"
-
-    def _h_help(self, intent, lang, context) -> str:
-        return i18n.t("help_text", lang)
+            ),
+        }
