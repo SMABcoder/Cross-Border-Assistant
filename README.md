@@ -37,7 +37,7 @@ Topic C scope): **remittances** (expensive, opaque transfer fees),
 | # | Deliverable | Location |
 |---|---|---|
 | 01 | Technical documentation | This repo: `docs/TECHNICAL-DOCUMENTATION.md` (architecture, core algorithms, security design) + `ARCHITECTURE.md` + `docs/` |
-| 02 | Presentation deck | Produced separately (not in this repo) |
+| 02 | Presentation deck | Produced separately (not in this repo) |"https://drive.google.com/file/d/1ehMsUzMt7j6_LKmEKO-yJB1uTGhoyo4U/view?usp=drivesdk"
 | 03 | Demo video (≤ 5 min, **required**) | Produced separately (not in this repo) |
 | 04 | Source code + README + test cases (+ deployment instructions) | **This repo** — see Deployment below |
 | 05 | Security self-assessment | `docs/SECURITY.md` |
